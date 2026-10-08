@@ -1,0 +1,1849 @@
+import mongoose from "mongoose";
+import { NextFunction, Request, Response } from "express";
+import { z } from "zod";
+import { DriverAvailabilityStatus, DriverProfile } from "../models/DriverProfile.js";
+import { DriverShift } from "../models/DriverShift.js";
+import { Trip, TripStatus } from "../models/Trip.js";
+import { User } from "../models/User.js";
+import {
+  CENTRAL_TZ,
+  getCentralDayAbbr,
+  getCentralDayBounds,
+  getCentralDayFull,
+  getCentralTodayStr,
+  getCentralTomorrowStr,
+  parseCentralDateTime,
+  calculateShiftDuration,
+} from "../utils/dateUtils.js";
+
+
+
+const availabilitySchema = z.object({
+  availabilityStatus: z.enum(["OFFLINE", "ONLINE", "UNAVAILABLE"], {
+    errorMap: () => ({ message: "Invalid availability status. Must be OFFLINE, ONLINE, or UNAVAILABLE." }),
+  }),
+});
+
+const locationSchema = z.object({
+  latitude: z
+    .number({ required_error: "Latitude is required" })
+    .min(-90, "Latitude must be >= -90")
+    .max(90, "Latitude must be <= 90"),
+  longitude: z
+    .number({ required_error: "Longitude is required" })
+    .min(-180, "Longitude must be >= -180")
+    .max(180, "Longitude must be <= 180"),
+});
+
+function extractPhotoUrls(...sources: any[]): string[] {
+  const result: string[] = [];
+  for (const src of sources) {
+    if (!src) continue;
+    if (Array.isArray(src)) {
+      src.forEach((item) => {
+        if (typeof item === "string" && item.trim() && !result.includes(item.trim())) {
+          result.push(item.trim());
+        }
+      });
+    } else if (typeof src === "string" && src.trim()) {
+      const val = src.trim();
+      if (val.startsWith("[") && val.endsWith("]")) {
+        try {
+          const parsed = JSON.parse(val);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((item) => {
+              if (typeof item === "string" && item.trim() && !result.includes(item.trim())) {
+                result.push(item.trim());
+              }
+            });
+            continue;
+          }
+        } catch {}
+      }
+      if (!result.includes(val)) {
+        result.push(val);
+      }
+    }
+  }
+  return result;
+}
+
+export interface FortnightPeriod {
+  id: string;
+  startDate: string;
+  endDate: string;
+  label: string;
+  isCurrent: boolean;
+  expectedPayDate: string;
+  payrollStatus: "Approved" | "Paid" | "Entered into Payroll" | "Waiting Deposit";
+}
+
+export function getFortnightlyPeriods(joinDate?: Date, count = 20): FortnightPeriod[] {
+  const baseAnchor = new Date("2026-08-17T00:00:00.000Z");
+  const now = new Date();
+  
+  // Calculate how many 14-day periods have passed since the base anchor
+  const msPerFortnight = 14 * 24 * 60 * 60 * 1000;
+  const periodsPassed = Math.floor((now.getTime() - baseAnchor.getTime()) / msPerFortnight);
+  
+  // The current period's start date
+  const anchorCurrentStart = new Date(baseAnchor.getTime() + Math.max(0, periodsPassed) * msPerFortnight);
+
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const minJoinTime = joinDate ? new Date(joinDate).getTime() : 0;
+
+  const periods: FortnightPeriod[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const pStart = new Date(anchorCurrentStart.getTime() - i * 14 * 24 * 60 * 60 * 1000);
+    // ponytail: 14 inclusive days Mon-Sun (offset +13 days) to eliminate double-counted boundary day
+    const pEnd = new Date(pStart.getTime() + 13 * 24 * 60 * 60 * 1000);
+
+    // Stop generating past periods if the period end is before driver join date
+    if (minJoinTime > 0 && pEnd.getTime() < minJoinTime && i > 0) {
+      break;
+    }
+
+    const startY = pStart.getUTCFullYear();
+    const startM = String(pStart.getUTCMonth() + 1).padStart(2, "0");
+    const startD = String(pStart.getUTCDate()).padStart(2, "0");
+    const startDateStr = `${startY}-${startM}-${startD}`;
+
+    const endY = pEnd.getUTCFullYear();
+    const endM = String(pEnd.getUTCMonth() + 1).padStart(2, "0");
+    const endD = String(pEnd.getUTCDate()).padStart(2, "0");
+    const endDateStr = `${endY}-${endM}-${endD}`;
+
+    const labelStart = `${monthNames[pStart.getUTCMonth()]} ${pStart.getUTCDate()}`;
+    const labelEnd = `${monthNames[pEnd.getUTCMonth()]} ${pEnd.getUTCDate()}, ${endY}`;
+    const label = `${labelStart} – ${labelEnd}`;
+
+    const payDateObj = new Date(pEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
+    const expectedPayDate = `${monthNames[payDateObj.getUTCMonth()]} ${payDateObj.getUTCDate()}, ${payDateObj.getUTCFullYear()}`;
+
+    const isCurrent = i === 0;
+    const payrollStatus: "Approved" | "Paid" = isCurrent ? "Approved" : "Paid";
+
+    periods.push({
+      id: `${startDateStr}_${endDateStr}`,
+      startDate: startDateStr,
+      endDate: endDateStr,
+      label,
+      isCurrent,
+      expectedPayDate,
+      payrollStatus,
+    });
+  }
+
+  if (periods.length === 0) {
+    const pStart = anchorCurrentStart;
+    const pEnd = new Date(pStart.getTime() + 13 * 24 * 60 * 60 * 1000);
+    const startY = pStart.getUTCFullYear();
+    const startM = String(pStart.getUTCMonth() + 1).padStart(2, "0");
+    const startD = String(pStart.getUTCDate()).padStart(2, "0");
+    const endY = pEnd.getUTCFullYear();
+    const endM = String(pEnd.getUTCMonth() + 1).padStart(2, "0");
+    const endD = String(pEnd.getUTCDate()).padStart(2, "0");
+    const labelStart = `${monthNames[pStart.getUTCMonth()]} ${pStart.getUTCDate()}`;
+    const labelEnd = `${monthNames[pEnd.getUTCMonth()]} ${pEnd.getUTCDate()}, ${endY}`;
+    const payDateObj = new Date(pEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
+
+    periods.push({
+      id: `${startY}-${startM}-${startD}_${endY}-${endM}-${endD}`,
+      startDate: `${startY}-${startM}-${startD}`,
+      endDate: `${endY}-${endM}-${endD}`,
+      label: `${labelStart} – ${labelEnd}`,
+      isCurrent: true,
+      expectedPayDate: `${monthNames[payDateObj.getUTCMonth()]} ${payDateObj.getUTCDate()}, ${payDateObj.getUTCFullYear()}`,
+      payrollStatus: "Approved",
+    });
+  }
+
+  return periods;
+}
+
+/** Parse time string like "08:00 AM" or "16:00" into { hours, minutes } */
+function parseTimeStr(timeStr: string): { hours: number; minutes: number } | null {
+  if (!timeStr) return null;
+  const trimmed = timeStr.trim();
+  // Support "HH:MM AM/PM" format
+  const ampm = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(trimmed);
+  if (ampm) {
+    let h = parseInt(ampm[1], 10);
+    const m = parseInt(ampm[2], 10);
+    const period = ampm[3].toUpperCase();
+    if (period === "PM" && h < 12) h += 12;
+    if (period === "AM" && h === 12) h = 0;
+    return { hours: h, minutes: m };
+  }
+  // Support "HH:MM" 24h format
+  const h24 = /^(\d{1,2}):(\d{2})$/.exec(trimmed);
+  if (h24) {
+    return { hours: parseInt(h24[1], 10), minutes: parseInt(h24[2], 10) };
+  }
+  return null;
+}
+
+export interface ScheduleCheckResult {
+  isWorkingDay: boolean;
+  startTime: string;
+  endTime: string;
+  scheduledStartMs: number;
+  scheduledEndMs: number;
+  allowStart: boolean;
+  reason: string;
+  isOneTimeOverride: boolean;
+}
+
+/**
+ * Resolve today's schedule for a driver profile.
+ * Checks one-time changes first (emergency overrides), then weekly schedule.
+ * Returns whether the driver is allowed to start a shift right now.
+ * Grace window: 15 min before scheduled start.
+ * Late cutoff: 60 min after scheduled end.
+ */
+export function resolveScheduleForToday(profile: any, now: Date = new Date()): ScheduleCheckResult {
+  const GRACE_BEFORE_MS = 15 * 60 * 1000;   // 15 min early
+  const LATE_CUTOFF_MS  = 60 * 60 * 1000;   // 60 min after end
+
+  const todayStr = getCentralTodayStr(now);
+  const todayAbbr = getCentralDayAbbr(now);
+
+  function checkDaySchedule(dateStr: string, dayAbbr: string) {
+    let override: any = null;
+    const oneTimeChanges: any[] = profile?.oneTimeChanges || [];
+    for (const ch of oneTimeChanges) {
+      if (!ch?.date) continue;
+      const chDate = getCentralTodayStr(new Date(ch.date));
+      if (chDate === dateStr) {
+        override = ch;
+        break;
+      }
+    }
+
+    let isWorkingDay: boolean;
+    let startTime: string;
+    let endTime: string;
+    let isOneTimeOverride = false;
+
+    if (override !== null) {
+      isOneTimeOverride = true;
+      isWorkingDay = override.working === true;
+      startTime = override.startTime || "08:00 AM";
+      endTime   = override.endTime   || "04:00 PM";
+    } else {
+      const weeklySchedule: any[] = profile?.weeklySchedule || [];
+      const dayEntry = weeklySchedule.find((d: any) => d.day === dayAbbr);
+      isWorkingDay = dayEntry ? dayEntry.working !== false : false;
+      startTime = dayEntry?.startTime || "08:00 AM";
+      endTime   = dayEntry?.endTime   || "04:00 PM";
+    }
+
+    if (!isWorkingDay) {
+      return {
+        isWorkingDay: false,
+        startTime,
+        endTime,
+        startMs: 0,
+        endMs: 0,
+        isOneTimeOverride,
+      };
+    }
+
+    let startMs = parseCentralDateTime(startTime, dateStr, now).getTime();
+    let endMs   = parseCentralDateTime(endTime, dateStr, now).getTime();
+
+    // If shift is overnight (e.g. 9:00 PM to 5:00 AM), end time is next morning (+24 hours)
+    if (endMs <= startMs) {
+      endMs += 24 * 60 * 60 * 1000;
+    }
+
+    return {
+      isWorkingDay: true,
+      startTime,
+      endTime,
+      startMs,
+      endMs,
+      isOneTimeOverride,
+    };
+  }
+
+  // 1. Check today's schedule
+  const todaySched = checkDaySchedule(todayStr, todayAbbr);
+  const nowMs = now.getTime();
+
+  if (todaySched.isWorkingDay) {
+    const tooEarly = nowMs < todaySched.startMs - GRACE_BEFORE_MS;
+    const tooLate  = nowMs > todaySched.endMs + LATE_CUTOFF_MS;
+
+    if (!tooEarly && !tooLate) {
+      return {
+        isWorkingDay: true,
+        startTime: todaySched.startTime,
+        endTime: todaySched.endTime,
+        scheduledStartMs: todaySched.startMs,
+        scheduledEndMs: todaySched.endMs,
+        allowStart: true,
+        reason: "",
+        isOneTimeOverride: todaySched.isOneTimeOverride,
+      };
+    }
+  }
+
+  // 2. If not inside today's shift window, check if we are in the early morning continuation of yesterday's overnight shift
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const yesterdayStr = getCentralTodayStr(yesterday);
+  const yesterdayAbbr = getCentralDayAbbr(yesterday);
+  const yesterdaySched = checkDaySchedule(yesterdayStr, yesterdayAbbr);
+
+  if (yesterdaySched.isWorkingDay) {
+    const tooEarly = nowMs < yesterdaySched.startMs - GRACE_BEFORE_MS;
+    const tooLate  = nowMs > yesterdaySched.endMs + LATE_CUTOFF_MS;
+
+    if (!tooEarly && !tooLate) {
+      return {
+        isWorkingDay: true,
+        startTime: yesterdaySched.startTime,
+        endTime: yesterdaySched.endTime,
+        scheduledStartMs: yesterdaySched.startMs,
+        scheduledEndMs: yesterdaySched.endMs,
+        allowStart: true,
+        reason: "",
+        isOneTimeOverride: yesterdaySched.isOneTimeOverride,
+      };
+    }
+  }
+
+  // 3. Return refusal reason based on today's schedule
+  if (!todaySched.isWorkingDay) {
+    return {
+      isWorkingDay: false,
+      startTime: todaySched.startTime,
+      endTime: todaySched.endTime,
+      scheduledStartMs: 0,
+      scheduledEndMs: 0,
+      allowStart: false,
+      reason: "Today is your scheduled day off. Contact admin if you need to work today.",
+      isOneTimeOverride: todaySched.isOneTimeOverride,
+    };
+  }
+
+  const tooEarly = nowMs < todaySched.startMs - GRACE_BEFORE_MS;
+  const reason = tooEarly
+    ? `Your shift starts at ${todaySched.startTime}. You can clock in up to 15 minutes before (${new Date(todaySched.startMs - GRACE_BEFORE_MS).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}).`
+    : `Your shift ended at ${todaySched.endTime}. Clock-in window for today has passed. Contact admin if you need a schedule adjustment.`;
+
+  return {
+    isWorkingDay: true,
+    startTime: todaySched.startTime,
+    endTime: todaySched.endTime,
+    scheduledStartMs: todaySched.startMs,
+    scheduledEndMs: todaySched.endMs,
+    allowStart: false,
+    reason,
+    isOneTimeOverride: todaySched.isOneTimeOverride,
+  };
+}
+
+export function resolveScheduleForDate(profile: any, dateStr: string, now: Date = new Date()): ScheduleCheckResult {
+  const dateObj = new Date(dateStr + "T00:00:00");
+  const dayAbbr = getCentralDayAbbr(dateObj);
+  const GRACE_BEFORE_MS = 15 * 60 * 1000;
+  const LATE_CUTOFF_MS  = 60 * 60 * 1000;
+
+  const oneTimeChanges: any[] = profile?.oneTimeChanges || [];
+  let override: any = null;
+  for (const ch of oneTimeChanges) {
+    if (!ch?.date) continue;
+    const chDate = getCentralTodayStr(new Date(ch.date));
+    if (chDate === dateStr) {
+      override = ch;
+      break;
+    }
+  }
+
+  let isWorkingDay: boolean;
+  let startTime: string;
+  let endTime: string;
+  let isOneTimeOverride = false;
+
+  if (override !== null) {
+    isOneTimeOverride = true;
+    isWorkingDay = override.working === true;
+    startTime = override.startTime || "08:00 AM";
+    endTime   = override.endTime   || "04:00 PM";
+  } else {
+    const weeklySchedule: any[] = profile?.weeklySchedule || [];
+    const dayEntry = weeklySchedule.find((d: any) => d.day === dayAbbr);
+    isWorkingDay = dayEntry ? dayEntry.working !== false : false;
+    startTime = dayEntry?.startTime || "08:00 AM";
+    endTime   = dayEntry?.endTime   || "04:00 PM";
+  }
+
+  if (!isWorkingDay) {
+    return {
+      isWorkingDay: false,
+      startTime,
+      endTime,
+      scheduledStartMs: 0,
+      scheduledEndMs: 0,
+      allowStart: false,
+      reason: "Scheduled day off.",
+      isOneTimeOverride,
+    };
+  }
+
+  let startMs = parseCentralDateTime(startTime, dateStr, now).getTime();
+  let endMs   = parseCentralDateTime(endTime, dateStr, now).getTime();
+  if (endMs <= startMs) {
+    endMs += 24 * 60 * 60 * 1000;
+  }
+
+  const nowMs = now.getTime();
+  let allowStart = true;
+  let reason = "Shift allowed.";
+
+  if (nowMs < startMs - GRACE_BEFORE_MS) {
+    allowStart = false;
+    reason = `Too early to start shift. Scheduled start time is ${startTime}.`;
+  } else if (nowMs > endMs + LATE_CUTOFF_MS) {
+    allowStart = false;
+    reason = `Shift window has passed. Scheduled end time was ${endTime}.`;
+  }
+
+  return {
+    isWorkingDay: true,
+    startTime,
+    endTime,
+    scheduledStartMs: startMs,
+    scheduledEndMs: endMs,
+    allowStart,
+    reason,
+    isOneTimeOverride,
+  };
+}
+
+export async function checkAndAutoEndActiveShift(driverId: string | mongoose.Types.ObjectId, profile: any, now: Date = new Date()) {
+  const activeShift = await DriverShift.findOne({
+    driverId,
+    status: "IN_PROGRESS",
+  });
+
+  if (!activeShift) return null;
+
+  const sched = resolveScheduleForDate(profile, activeShift.shiftDate, now);
+  if (!sched || !sched.scheduledEndMs) return activeShift;
+
+  const MAX_SHIFT_MS = 24 * 60 * 60 * 1000; // 24 hours safety cap
+
+  // If the shift was started AFTER the scheduled end (overnight/late/emergency start),
+  // do NOT auto-end via the schedule. These are valid out-of-window shifts.
+  // Apply a 24-hour safety cap from actual start time only.
+  if (activeShift.startedAt && activeShift.startedAt.getTime() >= sched.scheduledEndMs) {
+    const elapsedMs = now.getTime() - activeShift.startedAt.getTime();
+    if (elapsedMs <= MAX_SHIFT_MS) {
+      // Still within 24 hours from start — let the shift run normally
+      return activeShift;
+    }
+    // Fallen beyond 24 hours from start — force end as safety measure
+  }
+
+  if (now.getTime() > sched.scheduledEndMs) {
+    // Do NOT auto-end if the driver still has active trips in progress.
+    // Drivers must be able to complete any ACCEPTED/en-route/pickup trips.
+    const activeTripCount = await Trip.countDocuments({
+      driverId,
+      status: { $in: ["ACCEPTED", "DRIVER_ARRIVING", "DRIVER_ARRIVED", "IN_PROGRESS"] },
+    });
+    if (activeTripCount > 0) {
+      // Hold off auto-ending — driver is mid-trip
+      return activeShift;
+    }
+
+    const scheduledEndDate = new Date(sched.scheduledEndMs);
+    const diffMs = Math.max(0, now.getTime() - activeShift.startedAt.getTime());
+    const totalMinutes = Math.max(1, Math.round(diffMs / 60000));
+    const hours = Math.floor(totalMinutes / 60);
+    const mins = totalMinutes % 60;
+    const totalHoursText = `${hours}h ${mins < 10 ? "0" : ""}${mins}m`;
+
+    activeShift.status = "COMPLETED";
+    activeShift.endedAt = scheduledEndDate;
+    activeShift.totalMinutes = totalMinutes;
+    activeShift.totalHoursText = totalHoursText;
+    activeShift.autoEnded = true;
+    activeShift.pendingEndReport = true;
+    await activeShift.save();
+
+    await DriverProfile.findOneAndUpdate(
+      { userId: driverId },
+      { availabilityStatus: "OFFLINE" }
+    );
+
+    return null;
+  }
+
+  return activeShift;
+}
+
+export function countTodayTripsForDriver(trips: any[], now: Date = new Date()): number {
+  const todayFull = getCentralDayFull(now).toLowerCase();
+  const todayShort = getCentralDayAbbr(now).toLowerCase();
+  const todayStr = getCentralTodayStr(now);
+
+  let count = 0;
+
+  trips.forEach((t: any) => {
+    if (["CANCELLED", "QUOTE_DENIED"].includes(t.status)) return;
+
+    const isRecurring = t.schedule === "recurring" || t.tripType === "recurring" || (Array.isArray(t.recurringDays) && t.recurringDays.length > 0);
+    if (isRecurring && Array.isArray(t.recurringDays) && t.recurringDays.length > 0) {
+      const matchesDay = t.recurringDays.some((day: string) => {
+        const d = String(day).trim().toLowerCase();
+        return d === todayFull || d === todayShort || todayFull.startsWith(d);
+      });
+      if (!matchesDay) return;
+    }
+
+    const rawOutbound = t.startDate || t.pickupDate || t.createdAt;
+    const outboundDate = rawOutbound ? getCentralTodayStr(new Date(rawOutbound)) : "";
+
+    const rawReturn = t.endDate || t.returnDate || t.startDate || t.pickupDate || t.createdAt;
+    const returnDate = rawReturn ? getCentralTodayStr(new Date(rawReturn)) : "";
+
+    const isRoundTrip = t.tripType === "round-trip" || t.tripType === "round_trip" || t.isRoundTrip === true;
+
+    const outboundMatches = outboundDate === todayStr || isRecurring;
+    if (outboundMatches) {
+      count++;
+    }
+
+    if (isRoundTrip && (t.returnPickupTime || t.returnPickupAddress)) {
+      const returnMatches = returnDate === todayStr || isRecurring;
+      if (returnMatches) {
+        count++;
+      }
+    }
+  });
+
+  return count;
+}
+
+export class DriverController {
+  async getProfile(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const user = await User.findById(req.user.userId).lean();
+      if (!user) {
+        res.status(404).json({ success: false, error: { code: "USER_NOT_FOUND", message: "Driver account not found" } });
+        return;
+      }
+
+      const profile = await DriverProfile.findOne({ userId: req.user.userId }).lean();
+
+      res.status(200).json({
+        success: true,
+        data: {
+          user: {
+            id: user._id.toString(),
+            email: user.email,
+            name: user.name,
+            phone: user.phone,
+            role: user.role,
+            accountStatus: user.accountStatus,
+            avatarUrl: user.avatarUrl || profile?.avatarUrl || "",
+          },
+          profile: profile
+            ? {
+                licenseNumber: profile.licenseNumber,
+                licenseExpirationDate: profile.licenseExpirationDate,
+                avatarUrl: profile.avatarUrl || user.avatarUrl || "",
+                vehicle: profile.vehicle,
+                approvalStatus: profile.approvalStatus,
+                availabilityStatus: profile.availabilityStatus,
+                currentLocation: profile.currentLocation,
+                completedTripsCount: profile.completedTripsCount,
+              }
+            : null,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async updateProfile(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const { name, phone, licenseNumber, licenseExpirationDate, avatarUrl } = req.body;
+
+      // Update User document
+      const userUpdate: Record<string, any> = {};
+      if (name !== undefined) userUpdate.name = name;
+      if (phone !== undefined) userUpdate.phone = phone;
+      if (avatarUrl !== undefined) userUpdate.avatarUrl = avatarUrl;
+
+      const user = await User.findByIdAndUpdate(req.user.userId, userUpdate, { new: true }).lean();
+      if (!user) {
+        res.status(404).json({ success: false, error: { code: "USER_NOT_FOUND", message: "Driver account not found" } });
+        return;
+      }
+
+      // Update DriverProfile document
+      const profileUpdate: Record<string, any> = {};
+      if (licenseNumber !== undefined) profileUpdate.licenseNumber = licenseNumber;
+      if (licenseExpirationDate !== undefined) profileUpdate.licenseExpirationDate = licenseExpirationDate;
+      if (avatarUrl !== undefined) profileUpdate.avatarUrl = avatarUrl;
+
+      const profile = await DriverProfile.findOneAndUpdate(
+        { userId: req.user.userId },
+        profileUpdate,
+        { new: true, upsert: true }
+      ).lean();
+
+      res.status(200).json({
+        success: true,
+        data: {
+          user: {
+            id: user._id.toString(),
+            email: user.email,
+            name: user.name,
+            phone: user.phone,
+            role: user.role,
+            accountStatus: user.accountStatus,
+            avatarUrl: user.avatarUrl || profile?.avatarUrl || "",
+          },
+          profile: {
+            licenseNumber: profile.licenseNumber,
+            licenseExpirationDate: profile.licenseExpirationDate,
+            avatarUrl: profile.avatarUrl || user.avatarUrl || "",
+            vehicle: profile.vehicle,
+            approvalStatus: profile.approvalStatus,
+            availabilityStatus: profile.availabilityStatus,
+            currentLocation: profile.currentLocation,
+            completedTripsCount: profile.completedTripsCount,
+          },
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async updateAvailability(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const parsed = availabilitySchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(422).json({
+          success: false,
+          error: {
+            code: "VALIDATION_FAILED",
+            message: "Invalid availability status",
+            details: parsed.error.flatten().fieldErrors,
+          },
+        });
+        return;
+      }
+
+      const { availabilityStatus } = parsed.data;
+
+      const profile = await DriverProfile.findOneAndUpdate(
+        { userId: req.user.userId },
+        { availabilityStatus: availabilityStatus as DriverAvailabilityStatus },
+        { new: true, upsert: true }
+      ).lean();
+
+      res.status(200).json({
+        success: true,
+        data: {
+          availabilityStatus: profile.availabilityStatus,
+          updatedAt: profile.updatedAt,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async updateLocation(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const parsed = locationSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(422).json({
+          success: false,
+          error: {
+            code: "VALIDATION_FAILED",
+            message: "Invalid location coordinates",
+            details: parsed.error.flatten().fieldErrors,
+          },
+        });
+        return;
+      }
+
+      const { latitude, longitude } = parsed.data;
+
+      const profile = await DriverProfile.findOneAndUpdate(
+        { userId: req.user.userId },
+        {
+          currentLocation: {
+            type: "Point",
+            coordinates: [longitude, latitude],
+            updatedAt: new Date(),
+          },
+        },
+        { new: true, upsert: true }
+      ).lean();
+
+      res.status(200).json({
+        success: true,
+        data: {
+          currentLocation: profile.currentLocation,
+          updatedAt: profile.updatedAt,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getTrips(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+      const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit as string, 10) || 10)); // Default limit 10
+      const skip = (page - 1) * limit;
+
+      const { status, tab } = req.query;
+      const driverId = req.user.userId;
+
+      // Exclude master parent container requests when child legs exist
+      const parentIdsWithChildren = await Trip.find({
+        parentRequestId: { $exists: true, $ne: null },
+      }).distinct("parentRequestId");
+
+      const baseFilter: Record<string, unknown> = { driverId };
+      if (parentIdsWithChildren.length > 0) {
+        baseFilter._id = { $nin: parentIdsWithChildren };
+      }
+
+      if (status) baseFilter.status = status;
+
+      const todayStr = getCentralTodayStr();
+      const tomorrowStr = getCentralTomorrowStr();
+
+      // Build filters for each tab
+      const getTabFilter = (tabName: string) => {
+        const f = { ...baseFilter };
+        if (tabName === "completed") {
+          f.$or = [
+            { status: "COMPLETED" },
+            { status: "CANCELLED", cancellationReason: { $in: ["No Show Up", "NO_SHOW"] } },
+          ];
+        } else if (tabName === "missed") {
+          f.$or = [
+            { status: "MISSED" },
+            { 
+              status: { $nin: ["COMPLETED", "IN_PROGRESS", "DRIVER_ARRIVING", "DRIVER_ARRIVED", "MISSED", "CANCELLED", "QUOTE_DENIED"] },
+              $or: [
+                { pickupDate: { $lt: todayStr } },
+                {
+                  $and: [
+                    { $or: [{ pickupDate: { $exists: false } }, { pickupDate: null }, { pickupDate: "" }] },
+                    { startDate: { $lt: todayStr } }
+                  ]
+                }
+              ]
+            }
+          ];
+        } else if (tabName === "today") {
+          f.status = { $nin: ["COMPLETED", "MISSED", "CANCELLED"] };
+          f.$or = [
+            { pickupDate: todayStr },
+            {
+              $and: [
+                { $or: [{ pickupDate: { $exists: false } }, { pickupDate: null }, { pickupDate: "" }] },
+                { startDate: todayStr }
+              ]
+            }
+          ];
+        } else if (tabName === "upcoming" || tabName === "nextDay") {
+          f.status = { $nin: ["COMPLETED", "MISSED", "CANCELLED"] };
+          f.$or = [
+            { pickupDate: tomorrowStr },
+            {
+              $and: [
+                { $or: [{ pickupDate: { $exists: false } }, { pickupDate: null }, { pickupDate: "" }] },
+                { startDate: tomorrowStr }
+              ]
+            }
+          ];
+        } else if (tabName === "all") {
+          // returns baseFilter
+        }
+        return f;
+      };
+
+      // Get counts for all tabs concurrently
+      const [todayCount, upcomingCount, completedCount, missedCount] = await Promise.all([
+        Trip.countDocuments(getTabFilter("today")),
+        Trip.countDocuments(getTabFilter("upcoming")),
+        Trip.countDocuments(getTabFilter("completed")),
+        Trip.countDocuments(getTabFilter("missed"))
+      ]);
+
+      const activeTab = tab ? (tab as string) : "today";
+      const activeFilter = getTabFilter(activeTab);
+
+      const sortLogic: any = (activeTab === "missed" || activeTab === "completed")
+        ? { pickupDate: -1, startDate: -1, scheduledTime: -1, completedAt: -1, createdAt: -1 }
+        : { scheduledTime: 1, pickupDate: 1, startDate: 1, createdAt: -1 };
+
+      const trips = await Trip.find(activeFilter)
+        .select("-signature -receiverSignature")
+        .populate("passengerId", "name email phone avatarUrl")
+        .sort(sortLogic)
+        .skip(skip)
+        .limit(limit)
+        .lean();
+
+      const total = await Trip.countDocuments(activeFilter);
+
+      res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.set("Pragma", "no-cache");
+      res.set("Expires", "0");
+
+      res.status(200).json({
+        success: true,
+        data: {
+          trips,
+          counts: {
+            today: todayCount,
+            upcoming: upcomingCount,
+            nextDay: upcomingCount,
+            completed: completedCount,
+            missed: missedCount
+          },
+          pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getActiveTrip(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const driverId = req.user.userId;
+
+      // Find a single active trip for the driver
+      const activeTrip = await Trip.findOne({
+        driverId,
+        status: { $in: ["DRIVER_ARRIVING", "DRIVER_ARRIVED", "IN_PROGRESS"] },
+      })
+        .populate("passengerId", "name email phone avatarUrl")
+        .sort({ updatedAt: -1 })
+        .lean();
+
+      res.status(200).json({
+        success: true,
+        data: activeTrip || null,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async updateTripStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const id = req.params.id as string;
+      const { status, cancellationReason, driverNotes, receiverSignature, receiverName, receiverRelationship } = req.body;
+
+      const validStatuses: TripStatus[] = ["DRIVER_ARRIVING", "DRIVER_ARRIVED", "IN_PROGRESS", "COMPLETED", "CANCELLED"];
+      if (!status || !validStatuses.includes(status)) {
+        res.status(400).json({
+          success: false,
+          error: { code: "INVALID_STATUS", message: `Status must be one of: ${validStatuses.join(", ")}` },
+        });
+        return;
+      }
+
+      const trip = await Trip.findOne({ _id: id, driverId: req.user.userId });
+      if (!trip) {
+        res.status(404).json({ success: false, error: { code: "TRIP_NOT_FOUND", message: "Trip not found or not assigned to driver" } });
+        return;
+      }
+
+      // Enforce Hand to Hand drop-off signature requirement if trip requires Hand to Hand
+      const isHandToHand = Array.isArray(trip.mobilityOptions) &&
+        trip.mobilityOptions.some((opt: string) => opt.toLowerCase().includes("hand"));
+
+      if (status === "COMPLETED" && isHandToHand) {
+        const sig = receiverSignature || trip.receiverSignature;
+        if (!sig) {
+          res.status(400).json({
+            success: false,
+            error: {
+              code: "RECEIVER_SIGNATURE_REQUIRED",
+              message: "Hand to Hand drop-off requires the receiver's digital signature before completing the trip.",
+            },
+          });
+          return;
+        }
+      }
+
+      // Enforce that driver has an active shift started today before performing trip status updates
+      const todayStr = new Date().toISOString().split("T")[0];
+      const activeShift = await DriverShift.findOne({
+        driverId: req.user.userId,
+        shiftDate: todayStr,
+        status: "IN_PROGRESS",
+      });
+
+      if (!activeShift) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: "SHIFT_NOT_STARTED",
+            message: "You must start your shift from the 'My Schedule & Attendance' page before performing trip actions or starting a pickup.",
+          },
+        });
+        return;
+      }
+
+
+      // Enforce valid state machine transitions
+      const ALLOWED_TRANSITIONS: Record<TripStatus, TripStatus[]> = {
+        REQUESTED: ["ACCEPTED", "CANCELLED"],
+        QUOTE_SENT: ["CANCELLED"],
+        QUOTE_ACCEPTED: ["ACCEPTED", "CANCELLED"],
+        QUOTE_DENIED: [],
+        QUOTE_COUNTERED: ["CANCELLED"],
+        ACCEPTED: ["DRIVER_ARRIVING", "CANCELLED"],
+        DRIVER_ARRIVING: ["DRIVER_ARRIVED", "CANCELLED"],
+        DRIVER_ARRIVED: ["IN_PROGRESS", "CANCELLED"],
+        IN_PROGRESS: ["COMPLETED", "CANCELLED"],
+        COMPLETED: [],
+        CANCELLED: [],
+        MISSED: [],
+      };
+
+      const allowed = ALLOWED_TRANSITIONS[trip.status] || [];
+      if (!allowed.includes(status)) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: "INVALID_STATE_TRANSITION",
+            message: `Cannot transition trip from '${trip.status}' to '${status}'`,
+          },
+        });
+        return;
+      }
+
+      trip.status = status;
+      const statusNow = new Date();
+      if (status === "DRIVER_ARRIVING") {
+        trip.arrivingAt = statusNow;
+      } else if (status === "DRIVER_ARRIVED") {
+        trip.arrivedAt = statusNow;
+      } else if (status === "IN_PROGRESS") {
+        trip.inProgressAt = statusNow;
+        if (!trip.startedAt) trip.startedAt = statusNow;
+      } else if (status === "COMPLETED") {
+        if (!trip.completedAt) trip.completedAt = statusNow;
+        if (receiverSignature) trip.receiverSignature = receiverSignature;
+        if (receiverName) trip.receiverName = receiverName;
+        if (receiverRelationship) trip.receiverRelationship = receiverRelationship;
+        if (receiverSignature && !trip.receiverSignedAt) trip.receiverSignedAt = statusNow;
+      } else if (status === "CANCELLED") {
+        if (!trip.cancelledAt) trip.cancelledAt = statusNow;
+        if (cancellationReason) {
+          trip.cancellationReason = cancellationReason;
+        }
+        if (driverNotes) {
+          trip.driverShiftNotes = driverNotes;
+        }
+        // For No Show Up trips, passenger is not charged for this specific trip
+        if (cancellationReason === "No Show Up" || cancellationReason === "NO_SHOW") {
+          trip.fare = 0;
+        }
+      }
+
+      await trip.save();
+
+      // If completed or cancelled, free up the driver availability
+      if (status === "COMPLETED" || status === "CANCELLED") {
+        const updateObj: Record<string, unknown> = { availabilityStatus: "ONLINE" };
+        if (status === "COMPLETED") {
+          updateObj.$inc = { completedTripsCount: 1 };
+        }
+
+        // If this is a child leg, check if all sibling legs under the parent request are completed or cancelled
+        if (trip.parentRequestId) {
+          const remainingIncomplete = await Trip.countDocuments({
+            parentRequestId: trip.parentRequestId,
+            status: { $nin: ["COMPLETED", "CANCELLED"] },
+          });
+          if (remainingIncomplete === 0) {
+            const completedCount = await Trip.countDocuments({
+              parentRequestId: trip.parentRequestId,
+              status: "COMPLETED",
+            });
+            await Trip.findByIdAndUpdate(trip.parentRequestId, {
+              status: completedCount > 0 ? "COMPLETED" : "CANCELLED",
+              completedAt: statusNow,
+            });
+          }
+        }
+
+        await DriverProfile.findOneAndUpdate({ userId: req.user.userId }, updateObj);
+      }
+
+      res.status(200).json({
+        success: true,
+        data: trip,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getTripById(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const id = req.params.id as string;
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        res.status(400).json({ success: false, error: { code: "INVALID_ID", message: "Invalid trip ID format" } });
+        return;
+      }
+
+      const trip = await Trip.findOne({ _id: id, driverId: req.user.userId })
+        .populate("passengerId", "name email phone avatarUrl")
+        .lean();
+
+      if (!trip) {
+        res.status(404).json({ success: false, error: { code: "TRIP_NOT_FOUND", message: "Trip not found or not assigned to driver" } });
+        return;
+      }
+
+      const profile = await DriverProfile.findOne({ userId: req.user.userId })
+        .select("vehicle availabilityStatus")
+        .lean();
+
+      res.status(200).json({
+        success: true,
+        data: {
+          ...trip,
+          driverProfile: profile,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async updateTripNotes(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const id = req.params.id as string;
+      const { driverNotes } = req.body;
+
+      const trip = await Trip.findOne({ _id: id, driverId: req.user.userId });
+      if (!trip) {
+        res.status(404).json({ success: false, error: { code: "TRIP_NOT_FOUND", message: "Trip not found or not assigned to driver" } });
+        return;
+      }
+
+      trip.driverShiftNotes = driverNotes || "";
+      await trip.save();
+
+      res.status(200).json({ success: true, data: trip });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getEarnings(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const driverId = req.user.userId;
+      const user = await User.findById(driverId).lean();
+      const profile = await DriverProfile.findOne({ userId: driverId }).lean();
+      
+      const hourlyRate = profile?.hourlyRate ?? 14.0;
+      const defaultApprovedHours = profile?.approvedHours ?? 80.0;
+      const tripBonusPerRide = profile?.tripBonusRate ?? 3.0;
+
+      const joinDate = user?.createdAt ? new Date(user.createdAt) : undefined;
+      const availablePeriods = getFortnightlyPeriods(joinDate, 20);
+
+      const qStart = req.query.startDate as string;
+      const qEnd = req.query.endDate as string;
+
+      let activePeriod = availablePeriods[0];
+      if (qStart && qEnd) {
+        const found = availablePeriods.find((p) => p.startDate === qStart && p.endDate === qEnd);
+        if (found) {
+          activePeriod = found;
+        } else {
+          const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+          const dS = new Date(qStart);
+          const dE = new Date(qEnd);
+          const labelStart = `${monthNames[dS.getUTCMonth()]} ${dS.getUTCDate()}`;
+          const labelEnd = `${monthNames[dE.getUTCMonth()]} ${dE.getUTCDate()}, ${dE.getUTCFullYear()}`;
+          const payDateObj = new Date(dE.getTime() + 5 * 24 * 60 * 60 * 1000);
+          const expectedPayDate = `${monthNames[payDateObj.getUTCMonth()]} ${payDateObj.getUTCDate()}, ${payDateObj.getUTCFullYear()}`;
+
+          activePeriod = {
+            id: `${qStart}_${qEnd}`,
+            startDate: qStart,
+            endDate: qEnd,
+            label: `${labelStart} – ${labelEnd}`,
+            isCurrent: false,
+            expectedPayDate,
+            payrollStatus: "Paid",
+          };
+        }
+      }
+
+      const startBounds = getCentralDayBounds(activePeriod.startDate);
+      const endBounds = getCentralDayBounds(activePeriod.endDate);
+      const filterStart = startBounds.start;
+      const filterEnd = endBounds.end;
+
+      // Exclude master parent container requests when child legs exist
+      const parentIdsWithChildren = await Trip.find({
+        parentRequestId: { $exists: true, $ne: null },
+      }).distinct("parentRequestId");
+
+      // Fetch completed trips and shifts in selected pay period in parallel matching admin portal criteria
+      const [completedTrips, completedShifts] = await Promise.all([
+        Trip.find({
+          driverId: user?._id || driverId,
+          status: "COMPLETED",
+          _id: { $nin: parentIdsWithChildren },
+          $or: [
+            { completedAt: { $gte: filterStart, $lte: filterEnd } },
+            { scheduledTime: { $gte: filterStart, $lte: filterEnd } },
+            { pickupDate: { $gte: activePeriod.startDate, $lte: activePeriod.endDate } },
+            { createdAt: { $gte: filterStart, $lte: filterEnd } },
+          ],
+        })
+          .populate("passengerId", "name")
+          .sort({ completedAt: -1, scheduledTime: -1, createdAt: -1 })
+          .lean(),
+        DriverShift.find({
+          driverId: user?._id || driverId,
+          $or: [
+            { startedAt: { $gte: filterStart, $lte: filterEnd } },
+            { endedAt: { $gte: filterStart, $lte: filterEnd } },
+          ],
+        }).lean(),
+      ]);
+
+      const completedTripsCount = completedTrips.length;
+      const tripBonus = Math.round((completedTripsCount * tripBonusPerRide) * 100) / 100;
+
+      // Calculate actual clocked hours from shift records in this pay period
+      const totalWorkedMinutes = completedShifts.reduce((sum: number, s: any) => {
+        if (s.totalMinutes !== undefined && s.totalMinutes !== null) {
+          return sum + s.totalMinutes;
+        }
+        if (s.startedAt && s.endedAt) {
+          return sum + Math.max(0, Math.floor((new Date(s.endedAt).getTime() - new Date(s.startedAt).getTime()) / 60000));
+        }
+        if (s.startedAt && s.status === "IN_PROGRESS") {
+          return sum + Math.max(0, Math.floor((Date.now() - new Date(s.startedAt).getTime()) / 60000));
+        }
+        return sum;
+      }, 0);
+      const clockedHours = Number((totalWorkedMinutes / 60).toFixed(2));
+
+      const regularWages = Math.round((hourlyRate * clockedHours) * 100) / 100;
+      const grossEarnings = Math.round((regularWages + tripBonus) * 100) / 100;
+
+      let customPeriodStatus = activePeriod.payrollStatus;
+      if (profile?.periodPayrollStatuses) {
+        const pMap = profile.periodPayrollStatuses as any;
+        const getStatus = (id: string) => (typeof pMap.get === "function" ? pMap.get(id) : pMap[id]);
+
+        availablePeriods.forEach((p) => {
+          const st = getStatus(p.id);
+          if (st) p.payrollStatus = st as any;
+        });
+
+        const currentActiveSt = getStatus(activePeriod.id);
+        if (currentActiveSt) {
+          customPeriodStatus = currentActiveSt;
+        }
+      }
+
+      const payrollStatus = customPeriodStatus || profile?.payrollStatus || "Approved";
+      const payPeriodRange = activePeriod.label;
+      const expectedPayDate = activePeriod.expectedPayDate;
+
+      // Map rides for ride history
+      const rideHistory = completedTrips.map((t: any) => {
+        const tripId = `TRP-${t._id.toString().substring(t._id.toString().length - 4).toUpperCase()}`;
+        const passengerName = t.fullName || (t.passengerId as any)?.name || "Passenger";
+        const pickup = t.pickupLocation?.address || "Pickup";
+        const dropoff = t.dropoffLocation?.address || t.returnDestinationAddress || "Destination";
+        
+        let dateStr = "—";
+        const rawDateStr = t.pickupDate || t.startDate;
+        if (rawDateStr && typeof rawDateStr === "string" && /^\d{4}-\d{2}-\d{2}$/.test(rawDateStr.trim())) {
+          const [y, m, d] = rawDateStr.trim().split("-").map(Number);
+          const noonUtc = new Date(Date.UTC(y, m - 1, d, 18, 0, 0));
+          dateStr = noonUtc.toLocaleDateString("en-US", {
+            month: "short",
+            day: "numeric",
+            timeZone: CENTRAL_TZ,
+          });
+        } else {
+          const dateVal = t.completedAt || t.scheduledTime || t.createdAt;
+          if (dateVal) {
+            const d = new Date(dateVal);
+            if (!isNaN(d.getTime())) {
+              dateStr = d.toLocaleDateString("en-US", {
+                month: "short",
+                day: "numeric",
+                timeZone: CENTRAL_TZ,
+              });
+            }
+          }
+        }
+
+        return {
+          date: dateStr,
+          tripId,
+          passenger: passengerName,
+          type: t.mobilityOptions?.includes("stretcher") ? "Stretcher" : t.mobilityOptions?.includes("wheelchair") ? "Wheelchair" : "Standard",
+          pickup,
+          destination: dropoff,
+          status: "Completed",
+          bonus: `+$${tripBonusPerRide.toFixed(2)}`,
+        };
+      });
+
+      res.status(200).json({
+        success: true,
+        data: {
+          hourlyRate,
+          clockedHours,
+          approvedHours: clockedHours,
+          totalWorkedHours: clockedHours,
+          completedTripsCount,
+          tripBonusPerRide,
+          tripBonusRate: tripBonusPerRide,
+          tripBonus,
+          regularWages,
+          grossEarnings,
+          totalEarnings: grossEarnings,
+          totalRides: completedTripsCount,
+          payrollStatus,
+          payPeriodRange,
+          expectedPayDate,
+          isCurrentPeriod: activePeriod.isCurrent,
+          selectedPeriod: activePeriod,
+          availablePeriods,
+          rideHistory,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getTodayShift(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const driverProfile = await DriverProfile.findOne({ userId: req.user.userId }).lean();
+      const now = new Date();
+      await checkAndAutoEndActiveShift(req.user.userId, driverProfile, now);
+
+      const todayStr = getCentralTodayStr(now);
+      const dayAbbr = getCentralDayAbbr(now);
+
+      let todaySched: any = null;
+      if (typeof (driverController as any) !== "undefined") {
+        // Fallback if needed
+      }
+
+      // Check oneTimeChanges & weeklySchedule
+      let isWorkingDay = false;
+      let startTime = "08:00 AM";
+      let endTime = "04:00 PM";
+
+      const oneTimeChanges: any[] = driverProfile?.oneTimeChanges || [];
+      const override = oneTimeChanges.find((ch: any) => ch?.date && getCentralTodayStr(new Date(ch.date)) === todayStr);
+
+      if (override) {
+        isWorkingDay = override.working === true;
+        startTime = override.startTime || "08:00 AM";
+        endTime = override.endTime || "04:00 PM";
+      } else {
+        const weeklySchedule: any[] = driverProfile?.weeklySchedule || [];
+        const dayEntry = weeklySchedule.find((d: any) => d.day === dayAbbr);
+        isWorkingDay = dayEntry ? dayEntry.working !== false : true;
+        startTime = dayEntry?.startTime || "08:00 AM";
+        endTime = dayEntry?.endTime || "04:00 PM";
+      }
+
+      const todayScheduleHours = isWorkingDay ? `${startTime} – ${endTime}` : "Day Off";
+
+      // First check if there is an in-progress shift
+      let shift = await DriverShift.findOne({
+        driverId: req.user.userId,
+        status: "IN_PROGRESS",
+      }).sort({ startedAt: -1 }).lean();
+
+      // If no in-progress shift, find latest shift created today
+      if (!shift) {
+        shift = await DriverShift.findOne({
+          driverId: req.user.userId,
+          shiftDate: todayStr,
+        }).sort({ createdAt: -1 }).lean();
+      }
+
+      const pendingEndReportShift = await DriverShift.findOne({
+        driverId: req.user.userId,
+        pendingEndReport: true,
+      }).sort({ createdAt: -1 }).lean();
+
+      const shiftData = shift ? { ...shift, todayScheduleHours } : { todayScheduleHours, status: null };
+
+      res.status(200).json({
+        success: true,
+        data: {
+          shift: shiftData,
+          todayScheduleHours,
+          todaySchedule: {
+            startTime,
+            endTime,
+            isWorkingDay,
+            hoursText: todayScheduleHours,
+          },
+          pendingEndReportShift: pendingEndReportShift || null,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getScheduleSummary(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const driverId = req.user.userId;
+      const now = new Date();
+      const driverProfile = await DriverProfile.findOne({ userId: driverId }).lean();
+      
+      // Check & auto end shift if scheduled end time passed
+      await checkAndAutoEndActiveShift(driverId, driverProfile, now);
+
+      const toDateStr = (d: Date) => {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, "0");
+        const day = String(d.getDate()).padStart(2, "0");
+        return `${y}-${m}-${day}`;
+      };
+
+      const todayStr = getCentralTodayStr(now);
+      const { start: todayStart, end: todayEnd } = getCentralDayBounds(todayStr, now);
+
+      // Start of current week (Monday) aligned with local date
+      const localTodayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const currentDayOfWeek = now.getDay();
+      const distanceToMon = (currentDayOfWeek + 6) % 7;
+      const startOfWeek = new Date(localTodayStart);
+      startOfWeek.setDate(startOfWeek.getDate() - distanceToMon);
+
+      const endOfWeek = new Date(startOfWeek);
+      endOfWeek.setDate(endOfWeek.getDate() + 6);
+      endOfWeek.setHours(23, 59, 59, 999);
+
+      const weekDateStrs: string[] = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(startOfWeek);
+        d.setDate(d.getDate() + i);
+        weekDateStrs.push(toDateStr(d));
+      }
+
+      // Exclude master parent container requests when child legs exist
+      const parentIdsWithChildren = await Trip.find({
+        parentRequestId: { $exists: true, $ne: null },
+      }).distinct("parentRequestId");
+
+      // Fetch today's trips, shift, week shifts, and pending end report shift concurrently
+      const [todayTrips, todayShift, weekShifts, pendingEndReportShift] = await Promise.all([
+        Trip.find({
+          driverId,
+          _id: { $nin: parentIdsWithChildren },
+          $or: [
+            { pickupDate: todayStr },
+            {
+              $and: [
+                { $or: [{ pickupDate: { $exists: false } }, { pickupDate: null }, { pickupDate: "" }] },
+                { $or: [{ startDate: todayStr }, { createdAt: { $gte: todayStart, $lt: todayEnd } }] }
+              ]
+            }
+          ]
+        }).lean(),
+
+        DriverShift.findOne({
+          driverId,
+          $or: [
+            { status: "IN_PROGRESS" },
+            { shiftDate: todayStr }
+          ]
+        }).sort({ createdAt: -1 }).lean(),
+
+        DriverShift.find({
+          driverId,
+          $or: [
+            { shiftDate: { $in: weekDateStrs } },
+            { createdAt: { $gte: startOfWeek, $lte: endOfWeek } }
+          ]
+        }).lean(),
+
+        DriverShift.findOne({
+          driverId,
+          pendingEndReport: true,
+        }).sort({ createdAt: -1 }).lean()
+      ]);
+
+      // Schedule config from DriverProfile
+      const weeklyScheduleConfig = driverProfile?.weeklySchedule || [];
+      const scheduleMapByDay = new Map(weeklyScheduleConfig.map((s: any) => [s.day, s]));
+      const dayAbbrKeys = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+      const getScheduleConfigForDate = (dateObj: Date, dateStr: string) => {
+        // Check one-time changes first
+        const oneTimeChanges: any[] = driverProfile?.oneTimeChanges || [];
+        for (const ch of oneTimeChanges) {
+          if (!ch?.date) continue;
+          const chDate = getCentralTodayStr(new Date(ch.date));
+          if (chDate === dateStr) {
+            const isWorking = ch.working === true;
+            const startTime = ch.startTime || "08:00 AM";
+            const endTime = ch.endTime || "04:00 PM";
+            const hoursText = isWorking ? `${startTime} – ${endTime}` : "Day Off";
+            return { isWorking, startTime, endTime, hoursText, isOneTimeOverride: true };
+          }
+        }
+
+        const key = dayAbbrKeys[dateObj.getDay()];
+        const cfg = scheduleMapByDay.get(key) as any;
+        if (cfg) {
+          const isWorking = cfg.working !== false;
+          const startTime = cfg.startTime || "08:00 AM";
+          const endTime = cfg.endTime || "04:00 PM";
+          const hoursText = isWorking ? `${startTime} – ${endTime}` : "Day Off";
+          return { isWorking, startTime, endTime, hoursText, isOneTimeOverride: false };
+        }
+        return { isWorking: true, startTime: "08:00 AM", endTime: "04:00 PM", hoursText: "08:00 AM – 04:00 PM", isOneTimeOverride: false };
+      };
+
+      const todayConfig = getScheduleConfigForDate(now, todayStr);
+      const todaySchedule = {
+        startTime: todayConfig.startTime,
+        endTime: todayConfig.endTime,
+        hours: todayConfig.isWorking ? calculateShiftDuration(todayConfig.startTime, todayConfig.endTime).text : "Day Off",
+      };
+
+      // 1. Today's Trip Summary
+      const totalTripsCount = todayTrips.length;
+      const completedTripsCount = todayTrips.filter((t: any) => t.status === "COMPLETED").length;
+      const inProgressTripsCount = todayTrips.filter((t: any) => ["DRIVER_ARRIVING", "DRIVER_ARRIVED", "IN_PROGRESS"].includes(t.status)).length;
+      const remainingTripsCount = Math.max(0, totalTripsCount - completedTripsCount - inProgressTripsCount);
+
+      const tripSummary = {
+        totalTrips: totalTripsCount,
+        completed: completedTripsCount,
+        inProgress: inProgressTripsCount,
+        remaining: remainingTripsCount,
+      };
+
+      // 2. Upcoming Schedule (Next 5 Days starting tomorrow)
+      const dayAbbrs = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+      const upcomingSchedule = [];
+      for (let i = 1; i <= 5; i++) {
+        const d = new Date(localTodayStart);
+        d.setDate(d.getDate() + i);
+        const dStr = toDateStr(d);
+        const dayCfg = getScheduleConfigForDate(d, dStr);
+        upcomingSchedule.push({
+          day: dayAbbrs[d.getDay()],
+          date: String(d.getDate()),
+          hours: dayCfg.hoursText,
+          status: dayCfg.isWorking ? "Scheduled" : "Day Off",
+        });
+      }
+
+      // 3. Weekly Schedule (7 Days of Current Week: Mon - Sun)
+      const fullDayNames = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+      const monthShortNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      
+      const shiftMap = new Map();
+      weekShifts.forEach((s: any) => {
+        if (s.shiftDate) {
+          shiftMap.set(s.shiftDate, s);
+        } else if (s.createdAt) {
+          shiftMap.set(toDateStr(new Date(s.createdAt)), s);
+        }
+      });
+
+      const weeklySchedule = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(startOfWeek);
+        d.setDate(d.getDate() + i);
+        const dateStr = toDateStr(d);
+        const dayName = fullDayNames[i];
+        const formattedDate = `${monthShortNames[d.getMonth()]} ${d.getDate()}`;
+        const dayCfg = getScheduleConfigForDate(d, dateStr);
+
+        const s = shiftMap.get(dateStr) as any;
+
+        // Shift Schedules: driver's actual schedule from admin portal / one-time changes
+        const shiftSchedule = dayCfg.hoursText;
+
+        // Shift Logs: actual clock-in / clock-out times
+        let shiftLogs = "—";
+        let totalHours = "—";
+
+        if (s) {
+          if (s.startedAt && s.endedAt) {
+            const startT = new Date(s.startedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
+            const endT = new Date(s.endedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
+            shiftLogs = `${startT} – ${endT}`;
+          } else if (s.startedAt) {
+            const startT = new Date(s.startedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
+            shiftLogs = `${startT} – In Progress`;
+          }
+
+          if (s.totalHoursText) {
+            totalHours = s.totalHoursText;
+          } else if (s.status === "IN_PROGRESS" && s.startedAt) {
+            const diffMs = Date.now() - new Date(s.startedAt).getTime();
+            const mins = Math.max(1, Math.round(diffMs / 60000));
+            totalHours = `${Math.floor(mins / 60)}h ${mins % 60}m`;
+          }
+        }
+
+        // Attendance status matching Admin Portal Weekly Schedule Overview:
+        // Day Off | Scheduled | Present | Late | Absent
+        let attendance = "Scheduled";
+        const scheduledStartDate = parseCentralDateTime(dayCfg.startTime, dateStr);
+
+        if (!dayCfg.isWorking) {
+          attendance = "Day Off";
+        } else if (s && s.startedAt) {
+          const startedDate = new Date(s.startedAt);
+          const isLate = startedDate.getTime() > scheduledStartDate.getTime() + 15 * 60 * 1000;
+          if (isLate) {
+            attendance = "Late";
+          } else {
+            attendance = "Present";
+          }
+        } else {
+          // No shift started yet
+          if (now.getTime() > scheduledStartDate.getTime()) {
+            attendance = "Absent";
+          } else {
+            attendance = "Scheduled";
+          }
+        }
+
+        weeklySchedule.push({
+          day: dayName,
+          date: formattedDate,
+          dateStr,
+          shiftSchedule,
+          shiftLogs,
+          shiftHours: shiftLogs, // alias for backwards compatibility
+          total: totalHours,
+          attendance,
+          approval: "Approved", // kept for backwards compatibility if needed
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        data: {
+          todayShift: todayShift || null,
+          pendingEndReportShift: pendingEndReportShift || null,
+          todaySchedule,
+          todayScheduleCheck: resolveScheduleForToday(driverProfile),
+          tripSummary,
+          upcomingSchedule,
+          weeklySchedule,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async startShift(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const {
+        odometer,
+        fuel = "half",
+        condition = "clear",
+        notes = "",
+        photoUrl = "",
+        startPhotoUrl = "",
+        photos,
+        startPhotos,
+        photoUrls,
+        startPhotoUrls,
+      } = req.body;
+      const rawOdometer = String(odometer || "").replace(/[^\d.]/g, "");
+      const numOdometer = parseFloat(rawOdometer);
+
+      const collectedStartPhotos = extractPhotoUrls(photos, startPhotos, photoUrls, startPhotoUrls, photoUrl, startPhotoUrl);
+
+      if (isNaN(numOdometer) || numOdometer <= 0) {
+        res.status(400).json({
+          success: false,
+          error: { code: "INVALID_ODOMETER", message: "Valid starting odometer reading is required" },
+        });
+        return;
+      }
+
+      // Check if driver has a pending end shift report from auto-ended shift
+      const pendingReport = await DriverShift.findOne({
+        driverId: req.user.userId,
+        pendingEndReport: true,
+      });
+
+      if (pendingReport) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: "PENDING_SHIFT_REPORT",
+            message: "Please complete your previous shift end report before starting a new shift.",
+          },
+        });
+        return;
+      }
+
+      // Check if driver already has an in-progress shift
+      const existing = await DriverShift.findOne({
+        driverId: req.user.userId,
+        status: "IN_PROGRESS",
+      });
+
+      if (existing) {
+        res.status(400).json({
+          success: false,
+          error: { code: "SHIFT_IN_PROGRESS", message: "A shift is already currently in progress" },
+        });
+        return;
+      }
+
+      const profile = await DriverProfile.findOne({ userId: req.user.userId }).lean();
+      const todayStr = getCentralTodayStr();
+
+      // Schedule Enforcement
+      const scheduleCheck = resolveScheduleForToday(profile);
+      if (!scheduleCheck.allowStart) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: "SCHEDULE_NOT_ALLOWED",
+            message: scheduleCheck.reason,
+            schedule: {
+              isWorkingDay: scheduleCheck.isWorkingDay,
+              startTime: scheduleCheck.startTime,
+              endTime: scheduleCheck.endTime,
+              isOneTimeOverride: scheduleCheck.isOneTimeOverride,
+            },
+          },
+        });
+        return;
+      }
+
+      const shift = await DriverShift.create({
+        driverId: req.user.userId,
+        shiftDate: todayStr,
+        status: "IN_PROGRESS",
+        startedAt: new Date(),
+        startingOdometer: numOdometer,
+        startFuel: fuel,
+        startCondition: condition,
+        startNotes: notes,
+        startPhotoUrl: collectedStartPhotos[0] || photoUrl || startPhotoUrl || "",
+        startPhotoUrls: collectedStartPhotos,
+        vehicleInfo: profile?.vehicle ? {
+          make: profile.vehicle.make,
+          model: profile.vehicle.model,
+          year: profile.vehicle.year,
+          licensePlate: profile.vehicle.licensePlate,
+        } : undefined,
+      });
+
+      // Mark driver availability as ONLINE
+      await DriverProfile.findOneAndUpdate(
+        { userId: req.user.userId },
+        { availabilityStatus: "ONLINE" }
+      );
+
+      res.status(201).json({
+        success: true,
+        data: shift,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async endShift(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({ success: false, error: { code: "UNAUTHENTICATED", message: "Not authenticated" } });
+        return;
+      }
+
+      const {
+        odometer,
+        fuel = "half",
+        condition = "clear",
+        notes = "",
+        photoUrl = "",
+        endPhotoUrl = "",
+        photos,
+        endPhotos,
+        photoUrls,
+        endPhotoUrls,
+      } = req.body;
+      const rawOdometer = String(odometer || "").replace(/[^\d.]/g, "");
+      const numOdometer = parseFloat(rawOdometer);
+
+      const collectedEndPhotos = extractPhotoUrls(photos, endPhotos, photoUrls, endPhotoUrls, photoUrl, endPhotoUrl);
+
+      if (isNaN(numOdometer) || numOdometer <= 0) {
+        res.status(400).json({
+          success: false,
+          error: { code: "INVALID_ODOMETER", message: "Valid ending odometer reading is required" },
+        });
+        return;
+      }
+
+      let shift = await DriverShift.findOne({
+        driverId: req.user.userId,
+        status: "IN_PROGRESS",
+      });
+
+      if (!shift) {
+        shift = await DriverShift.findOne({
+          driverId: req.user.userId,
+          pendingEndReport: true,
+        }).sort({ createdAt: -1 });
+      }
+
+      if (!shift) {
+        res.status(404).json({
+          success: false,
+          error: { code: "NO_ACTIVE_SHIFT", message: "No active shift or pending end report found" },
+        });
+        return;
+      }
+
+      const endedAt = shift.endedAt || new Date();
+      const diffMs = endedAt.getTime() - shift.startedAt.getTime();
+      const totalMinutes = Math.max(1, Math.round(diffMs / 60000));
+      const hours = Math.floor(totalMinutes / 60);
+      const mins = totalMinutes % 60;
+      const totalHoursText = `${hours}h ${mins < 10 ? '0' : ''}${mins}m`;
+      const estimatedMiles = Math.max(0, parseFloat((numOdometer - shift.startingOdometer).toFixed(1)));
+
+      shift.status = "COMPLETED";
+      shift.endedAt = endedAt;
+      shift.endingOdometer = numOdometer;
+      shift.estimatedMiles = estimatedMiles;
+      shift.totalMinutes = totalMinutes;
+      shift.totalHoursText = totalHoursText;
+      shift.endFuel = fuel;
+      shift.endCondition = condition;
+      shift.endNotes = notes;
+      shift.endPhotoUrl = collectedEndPhotos[0] || photoUrl || endPhotoUrl || "";
+      shift.endPhotoUrls = collectedEndPhotos;
+      shift.pendingEndReport = false;
+
+      await shift.save();
+
+      await DriverProfile.findOneAndUpdate(
+        { userId: req.user.userId },
+        { availabilityStatus: "OFFLINE" }
+      );
+
+      res.status(200).json({
+        success: true,
+        data: shift,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+}
+
+export const driverController = new DriverController();
+
+
