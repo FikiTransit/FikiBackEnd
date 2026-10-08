@@ -1,0 +1,315 @@
+import mongoose, { Document, Schema } from "mongoose";
+import { ensureS3Image } from "../utils/imageHelper.js";
+
+export type TripStatus =
+  | "REQUESTED"
+  | "QUOTE_SENT"
+  | "QUOTE_ACCEPTED"
+  | "QUOTE_DENIED"
+  | "QUOTE_COUNTERED"
+  | "ACCEPTED"
+  | "DRIVER_ARRIVING"
+  | "DRIVER_ARRIVED"
+  | "IN_PROGRESS"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "MISSED";
+
+export type QuoteResponseAction = "ACCEPT" | "DENY" | "COUNTER";
+
+export interface ITrip extends Document {
+  passengerId: mongoose.Types.ObjectId;
+  driverId?: mongoose.Types.ObjectId;
+  pickupLocation: {
+    address: string;
+    coordinates?: [number, number];
+  };
+  dropoffLocation: {
+    address: string;
+    coordinates?: [number, number];
+  };
+  status: TripStatus;
+  fare?: number;
+  // Quote workflow fields
+  quotedFare?: number;
+  quotedAt?: Date;
+  quoteNote?: string;
+  quoteBreakdown?: {
+    baseFare?: number;
+    distance?: number;
+    ratePerMile?: number;
+    extraServices?: number;
+    discount?: number;
+    taxPercent?: number;
+  };
+  counterOffer?: number;
+  counterOfferedAt?: Date;
+  counterOfferNote?: string;
+  scheduledTime?: Date;
+  assignedAt?: Date;
+  acceptedAt?: Date;
+  arrivingAt?: Date;
+  arrivedAt?: Date;
+  inProgressAt?: Date;
+  startedAt?: Date;
+  completedAt?: Date;
+  cancelledAt?: Date;
+  cancellationReason?: string;
+  createdAt: Date;
+  updatedAt: Date;
+
+  // Passenger Information
+  passengerAvatarUrl?: string;
+  fullName?: string;
+  dateOfBirth?: string;
+  confirmDob?: boolean;
+  phoneNumber?: string;
+  email?: string;
+  streetAddress?: string;
+  city?: string;
+  state?: string;
+  zipCode?: string;
+  emergencyContactName?: string;
+  emergencyContactPhone?: string;
+  relationship?: string;
+
+  // Trip Information
+  tripType?: string;
+  schedule?: string;
+  startDate?: string;
+  endDate?: string;
+  pickupDate?: string;
+  pickupTime?: string;
+  appointmentTime?: string;
+  recurringStartDate?: string;
+  recurringEndDate?: string;
+  recurringDays?: string[];
+  recurringPickupTime?: string;
+  recurringAppointmentTime?: string;
+  returnPickupAddress?: string;
+  returnDestinationAddress?: string;
+  returnDate?: string;
+  returnPickupTime?: string;
+  driverNotes?: string;
+  driverShiftNotes?: string;
+
+  // Mobility & Special Needs
+  mobilityOptions?: string[];
+  specialInstructions?: string;
+  accessInformation?: string;
+
+  // Insurance / Payment
+  insuranceName?: string;
+  authNumber?: string;
+  privatePay?: boolean;
+
+  // Guardian Information
+  guardianName?: string;
+  guardianPhone?: string;
+  guardianEmail?: string;
+
+  // Consents & Agreements
+  consentPhoto?: boolean;
+  consentTransport?: boolean;
+  consentEsignature?: boolean;
+  consentHipaa?: boolean;
+
+  // Signature
+  signature?: string;
+  signatureDate?: string;
+  printedName?: string;
+  relationshipToPassenger?: string;
+
+  // Hand to Hand Receiver Signature
+  receiverSignature?: string;
+  receiverName?: string;
+  receiverRelationship?: string;
+  receiverSignedAt?: Date;
+
+  // Metadata / Source & Case Manager Info
+  requestSource?: string;
+  caseManagerName?: string;
+  caseManagerPhone?: string;
+  caseManagerEmail?: string;
+
+  // Recurring Legs & Hierarchy
+  parentRequestId?: mongoose.Types.ObjectId;
+  isReturnLeg?: boolean;
+  legType?: "OUTBOUND" | "RETURN";
+}
+
+const tripSchema = new Schema<ITrip>(
+  {
+    passengerId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    driverId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      index: true,
+    },
+    pickupLocation: {
+      address: { type: String, required: true },
+      coordinates: { type: [Number] },
+    },
+    dropoffLocation: {
+      address: { type: String, required: true },
+      coordinates: { type: [Number] },
+    },
+    status: {
+      type: String,
+      enum: [
+        "REQUESTED",
+        "QUOTE_SENT",
+        "QUOTE_ACCEPTED",
+        "QUOTE_DENIED",
+        "QUOTE_COUNTERED",
+        "ACCEPTED",
+        "DRIVER_ARRIVING",
+        "DRIVER_ARRIVED",
+        "IN_PROGRESS",
+        "COMPLETED",
+        "CANCELLED",
+        "MISSED",
+      ],
+      default: "REQUESTED",
+      required: true,
+      index: true,
+    },
+    fare: { type: Number },
+    quotedFare: { type: Number },
+    quotedAt: { type: Date },
+    quoteNote: { type: String },
+    quoteBreakdown: {
+      baseFare: { type: Number },
+      distance: { type: Number },
+      ratePerMile: { type: Number },
+      extraServices: { type: Number },
+      discount: { type: Number },
+      taxPercent: { type: Number },
+    },
+    counterOffer: { type: Number },
+    counterOfferedAt: { type: Date },
+    counterOfferNote: { type: String },
+    scheduledTime: { type: Date },
+    assignedAt: { type: Date },
+    acceptedAt: { type: Date },
+    arrivingAt: { type: Date },
+    arrivedAt: { type: Date },
+    inProgressAt: { type: Date },
+    startedAt: { type: Date },
+    completedAt: { type: Date },
+    cancelledAt: { type: Date },
+    cancellationReason: { type: String },
+
+    // Passenger Information
+    passengerAvatarUrl: { type: String },
+    fullName: { type: String },
+    dateOfBirth: { type: String },
+    confirmDob: { type: Boolean },
+    phoneNumber: { type: String },
+    email: { type: String },
+    streetAddress: { type: String },
+    city: { type: String },
+    state: { type: String },
+    zipCode: { type: String },
+    emergencyContactName: { type: String },
+    emergencyContactPhone: { type: String },
+    relationship: { type: String },
+
+    // Trip Information
+    tripType: { type: String },
+    schedule: { type: String },
+    startDate: { type: String },
+    endDate: { type: String },
+    pickupDate: { type: String },
+    pickupTime: { type: String },
+    appointmentTime: { type: String },
+    recurringStartDate: { type: String },
+    recurringEndDate: { type: String },
+    recurringDays: { type: [String] },
+    recurringPickupTime: { type: String },
+    recurringAppointmentTime: { type: String },
+    returnPickupAddress: { type: String },
+    returnDestinationAddress: { type: String },
+    returnDate: { type: String },
+    returnPickupTime: { type: String },
+    driverNotes: { type: String },
+    driverShiftNotes: { type: String },
+
+    // Mobility & Special Needs
+    mobilityOptions: { type: [String] },
+    specialInstructions: { type: String },
+    accessInformation: { type: String },
+
+    // Insurance / Payment
+    insuranceName: { type: String },
+    authNumber: { type: String },
+    privatePay: { type: Boolean },
+
+    // Guardian Information
+    guardianName: { type: String },
+    guardianPhone: { type: String },
+    guardianEmail: { type: String },
+
+    // Consents & Agreements
+    consentPhoto: { type: Boolean },
+    consentTransport: { type: Boolean },
+    consentEsignature: { type: Boolean },
+    consentHipaa: { type: Boolean },
+
+    // Signature
+    signature: { type: String },
+    signatureDate: { type: String },
+    printedName: { type: String },
+    relationshipToPassenger: { type: String },
+
+    // Hand to Hand Receiver Signature
+    receiverSignature: { type: String },
+    receiverName: { type: String },
+    receiverRelationship: { type: String },
+    receiverSignedAt: { type: Date },
+
+    // Metadata / Source & Case Manager Info
+    requestSource: { type: String },
+    caseManagerName: { type: String },
+    caseManagerPhone: { type: String },
+    caseManagerEmail: { type: String },
+
+    // Recurring Legs & Hierarchy
+    parentRequestId: { type: Schema.Types.ObjectId, ref: "Trip" },
+    isReturnLeg: { type: Boolean },
+    legType: { type: String },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+tripSchema.index({ status: 1, driverId: 1 });
+tripSchema.index({ status: 1, createdAt: -1 });
+tripSchema.index({ completedAt: -1, status: 1 });
+tripSchema.index({ createdAt: -1 });
+tripSchema.index({ driverId: 1, status: 1, pickupDate: 1 });
+tripSchema.index({ driverId: 1, pickupDate: 1 });
+tripSchema.index({ parentRequestId: 1 });
+tripSchema.index({ driverId: 1, schedule: 1, parentRequestId: 1 });
+tripSchema.index({ scheduledTime: 1, pickupDate: 1, createdAt: -1 });
+
+// Safety Net: Guarantee no raw base64 strings are saved to MongoDB
+tripSchema.pre("save", async function () {
+  if (this.isModified("passengerAvatarUrl") && this.passengerAvatarUrl) {
+    this.passengerAvatarUrl = (await ensureS3Image(this.passengerAvatarUrl, "passenger-avatars", "avatar")) || undefined;
+  }
+  if (this.isModified("signature") && this.signature) {
+    this.signature = (await ensureS3Image(this.signature, "signatures", "signature")) || undefined;
+  }
+  if (this.isModified("receiverSignature") && this.receiverSignature) {
+    this.receiverSignature = (await ensureS3Image(this.receiverSignature, "signatures", "receiver_sig")) || undefined;
+  }
+});
+
+export const Trip = mongoose.model<ITrip>("Trip", tripSchema);
