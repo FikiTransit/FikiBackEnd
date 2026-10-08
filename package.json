@@ -1,0 +1,53 @@
+{
+  "name": "fiki-transit-backend",
+  "version": "1.0.0",
+  "description": "Fiki Transit Backend API",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "node api.js && tsx watch src/server.ts",
+    "build": "node api.js && tsc",
+    "start": "node api.js && node dist/server.js",
+    "seed": "tsx src/scripts/seed.ts",
+    "migrate-base64": "tsx scripts/migrate_base64_to_s3.ts",
+    "migrate-localhost": "tsx scripts/migrate_localhost_to_s3.ts",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "fiki-transit",
+    "backend",
+    "express",
+    "mongodb",
+    "typescript"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1121.0",
+    "bcryptjs": "^3.0.2",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.10.1",
+    "multer": "^2.3.0",
+    "nodemailer": "^9.0.6",
+    "pino": "^9.6.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/compression": "^1.8.1",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.8",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^22.13.4",
+    "@types/nodemailer": "^8.0.1",
+    "pino-pretty": "^13.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
