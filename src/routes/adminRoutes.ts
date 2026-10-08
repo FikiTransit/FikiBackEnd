@@ -1,0 +1,63 @@
+import { Router } from "express";
+import { adminController } from "../controllers/adminController.js";
+import { fleetController } from "../controllers/fleetController.js";
+import { vehicleController } from "../controllers/vehicleController.js";
+import { authenticate, authorize } from "../middleware/authMiddleware.js";
+
+const router = Router();
+
+// All admin endpoints require authentication and ADMIN role
+router.use(authenticate, authorize("ADMIN"));
+
+router.get("/drivers", (req, res, next) => adminController.getDrivers(req, res, next));
+router.get("/drivers/:id", (req, res, next) => adminController.getDriverById(req, res, next));
+router.put("/drivers/:id", (req, res, next) => adminController.updateDriverProfile(req, res, next));
+router.patch("/drivers/:id/status", (req, res, next) => adminController.updateDriverStatus(req, res, next));
+router.put("/drivers/:id/schedule", (req, res, next) => adminController.updateDriverSchedule(req, res, next));
+router.post("/drivers/:id/one-time-change", (req, res, next) => adminController.addOneTimeChange(req, res, next));
+router.get("/drivers/:id/one-time-changes", (req, res, next) => adminController.getOneTimeChanges(req, res, next));
+router.put("/drivers/:id/one-time-changes/:changeId", (req, res, next) => adminController.updateOneTimeChange(req, res, next));
+router.delete("/drivers/:id/one-time-changes/:changeId", (req, res, next) => adminController.deleteOneTimeChange(req, res, next));
+router.delete("/drivers/:id", (req, res, next) => adminController.deleteDriver(req, res, next));
+
+router.get("/trips", (req, res, next) => adminController.getTrips(req, res, next));
+router.get("/trips/:id", (req, res, next) => adminController.getTripById(req, res, next));
+router.post("/trips", (req, res, next) => adminController.createTrip(req, res, next));
+router.put("/trips/:id", (req, res, next) => adminController.updateTrip(req, res, next));
+router.delete("/trips/:id", (req, res, next) => adminController.deleteTrip(req, res, next));
+router.post("/trips/:id/regenerate", (req, res, next) => adminController.regenerateTrips(req, res, next));
+router.post("/trips/:id/cancel", (req, res, next) => adminController.cancelTripAdmin(req, res, next));
+router.patch("/trips/:id/assign", (req, res, next) => adminController.assignDriver(req, res, next));
+router.patch("/trips/:id/quote", (req, res, next) => adminController.sendQuote(req, res, next));
+router.post("/trips/:id/counter-response", (req, res, next) => adminController.respondToCounterOffer(req, res, next));
+router.post("/trips/:id/approve", (req, res, next) => adminController.approveRideRequest(req, res, next));
+router.post("/trips/:id/reject", (req, res, next) => adminController.rejectRideRequest(req, res, next));
+
+router.get("/analytics", (req, res, next) => adminController.getAnalytics(req, res, next));
+router.get("/earnings", (req, res, next) => adminController.getDriverEarningsList(req, res, next));
+router.patch("/earnings/:driverId", (req, res, next) => adminController.updateDriverEarnings(req, res, next));
+router.get("/schedule-overview", (req, res, next) => adminController.getScheduleOverview(req, res, next));
+// System Settings
+router.put("/settings/dispatch-number", (req, res, next) => adminController.updateDispatchNumber(req, res, next));
+router.put("/settings/crm-content", (req, res, next) => adminController.updateCrmContent(req, res, next));
+
+router.get("/vehicle-reports", (req, res, next) => fleetController.getVehicleReports(req, res, next));
+router.get("/vehicle-reports/:id", (req, res, next) => fleetController.getShiftReportById(req, res, next));
+router.get("/shift-reports", (req, res, next) => fleetController.getShiftReports(req, res, next));
+router.get("/shift-reports/:id", (req, res, next) => fleetController.getShiftReportById(req, res, next));
+router.post("/vehicle-reports", (req, res, next) => fleetController.createVehicleReport(req, res, next));
+router.get("/driver-applications", (req, res, next) => fleetController.getDriverApplications(req, res, next));
+router.get("/driver-applications/:id", (req, res, next) => fleetController.getDriverApplicationById(req, res, next));
+router.patch("/driver-applications/:id/status", (req, res, next) => fleetController.updateDriverApplicationStatus(req, res, next));
+router.post("/driver-applications/:id/approve", (req, res, next) => fleetController.approveDriverApplication(req, res, next));
+
+router.get("/vehicles", (req, res, next) => vehicleController.getVehicles(req, res, next));
+router.post("/vehicles", (req, res, next) => vehicleController.createVehicle(req, res, next));
+router.put("/vehicles/:id", (req, res, next) => vehicleController.updateVehicle(req, res, next));
+router.delete("/vehicles/:id", (req, res, next) => vehicleController.deleteVehicle(req, res, next));
+
+router.get("/users", (req, res, next) => adminController.getUsers(req, res, next));
+router.put("/users/:id", (req, res, next) => adminController.updateUser(req, res, next));
+router.delete("/users/:id", (req, res, next) => adminController.deleteUser(req, res, next));
+
+export default router;
